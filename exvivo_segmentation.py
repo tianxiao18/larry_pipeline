@@ -118,17 +118,34 @@ def _patch_cellpose_trange() -> None:
 
 
 def main() -> None:
-    from cellpose import models
-
-    _patch_cellpose_trange()
-
-    use_gpu = True
-    model = models.CellposeModel(gpu=use_gpu, pretrained_model="cpsam")
-    print(f"[init] cellpose loaded gpu={use_gpu} device={getattr(model, 'device', '?')}",
-          flush=True)
+    model = None  # lazy: only load Cellpose if a volume actually needs segmenting
 
     summary = {"params": CELLPOSE_PARAMS, "volumes": {}}
     for tag, name, tif in VOLUMES:
+        cent_path = OUT_DIR / f"{tag}_centroids_3d.npy"
+        mask_path = OUT_DIR / f"{tag}_mask_3d.npz"
+        if cent_path.exists() and mask_path.exists():
+            cent = np.load(cent_path)
+            with np.load(mask_path) as npz:
+                mask_shape = list(npz["mask"].shape)
+                mask_dtype = str(npz["mask"].dtype)
+            print(f"[skip:{name}] cached centroids ({len(cent)}) + mask exist",
+                  flush=True)
+            summary["volumes"][tag] = {
+                "name": name, "tif": tif.name,
+                "shape": mask_shape, "n_cells": int(len(cent)),
+                "mask_dtype": mask_dtype,
+            }
+            continue
+
+        if model is None:
+            from cellpose import models
+            _patch_cellpose_trange()
+            use_gpu = True
+            model = models.CellposeModel(gpu=use_gpu, pretrained_model="cpsam")
+            print(f"[init] cellpose loaded gpu={use_gpu} "
+                  f"device={getattr(model, 'device', '?')}", flush=True)
+
         vol = load_volume(tif, name)
         vol_u8 = percentile_norm_u8(vol)
         del vol
