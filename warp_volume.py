@@ -26,7 +26,7 @@ import tifffile
 from scipy.ndimage import distance_transform_edt, map_coordinates
 from scipy.interpolate import RBFInterpolator
 
-from ransac_affine import DATA_DIR, RES, load_or_compute_mips, ransac_affine_3d
+from ransac_affine import DATA_DIR, RES, ransac_affine_3d
 from find_landmarks import (
     VIA_CSV, parse_via_csv, rasterize_blobs, assign_centroids_to_blobs,
     TPS_SMOOTHING, TPS_MAX_CTRL,
@@ -66,7 +66,6 @@ def main() -> None:
               f"det={r['det']:.3f}")
 
     polys = parse_via_csv(VIA_CSV)
-    _, _ = load_or_compute_mips("Larry_2A_8", B_TIF.name)   # ensure cached
     B_blob_mask = rasterize_blobs(polys["Larry_2A_8_xy_mip_clean.png"],
                                   (h_B, w_B))
     # No cropping: extend blob labels to cover the whole xy frame by
@@ -84,8 +83,9 @@ def main() -> None:
     asn = np.load(RES / "assignments_3d.npz")
     src_all = A_cent_3d[asn["matches"][:, 0]]
     dst_all = B_cent_3d[asn["matches"][:, 1]]
-    A_mip, _ = load_or_compute_mips("Larry_2A_1", A_TIF.name)
-    A_blob_mask_tps = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_mip.shape)
+    with tifffile.TiffFile(str(A_TIF)) as tf:
+        A_shape = tf.pages[0].shape
+    A_blob_mask_tps = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_shape)
     match_src_label = assign_centroids_to_blobs(A_cent_3d, A_blob_mask_tps)[asn["matches"][:, 0]]
     rng = np.random.default_rng(0)
     tps_disp_fields = {}   # blob_id -> (dz, dy, dx) coarse arrays on B grid

@@ -24,10 +24,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import tifffile
 from skimage.draw import polygon as sk_polygon
 from scipy.interpolate import RBFInterpolator
 
-from ransac_affine import RES, ransac_affine_3d, load_or_compute_mips
+from ransac_affine import DATA_DIR, RES, ransac_affine_3d
 
 TPS_SMOOTHING = 1.0   # RBF regularization (0 = exact interpolation through inliers)
 TPS_MAX_CTRL  = 400   # subsample inliers if more than this (O(N^3) solve)
@@ -114,13 +115,14 @@ def main() -> None:
     print(f"[via] parsed {sum(len(v) for v in polys.values())} polygons "
           f"from {len(polys)} files")
 
-    # MIPs are computed only to provide the (H, W) canvas shape that the
-    # VIA polygons were drawn on; the XZ MIP and pixel values are unused.
-    A_xy, _ = load_or_compute_mips("Larry_2A_1", "Larry_2A_1_488_4x.tif")
-    B_xy, _ = load_or_compute_mips("Larry_2A_8", "Larry_2A_8_488_4x.tif")
+    # (H, W) of the XY canvas the VIA polygons were drawn on.
+    with tifffile.TiffFile(str(DATA_DIR / "Larry_2A_1_488_4x.tif")) as tf:
+        A_shape = tf.pages[0].shape
+    with tifffile.TiffFile(str(DATA_DIR / "Larry_2A_8_488_4x.tif")) as tf:
+        B_shape = tf.pages[0].shape
 
-    A_blob_mask = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_xy.shape)
-    B_blob_mask = rasterize_blobs(polys["Larry_2A_8_xy_mip_clean.png"], B_xy.shape)
+    A_blob_mask = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_shape)
+    B_blob_mask = rasterize_blobs(polys["Larry_2A_8_xy_mip_clean.png"], B_shape)
     print(f"[via] A blob sizes: 1={int((A_blob_mask==1).sum())}, "
           f"2={int((A_blob_mask==2).sum())}, "
           f"outside={int((A_blob_mask==0).sum())}")
