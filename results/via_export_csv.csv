@@ -1,0 +1,5 @@
+filename,file_size,file_attributes,region_count,region_id,region_shape_attributes,region_attributes
+Larry_2A_1_xy_mip_clean.png,1359616,"{}",2,0,"{""name"":""polygon"",""all_points_x"":[917,1024,1357,1831,1943,1955,11,15],""all_points_y"":[1955,1445,1075,569,453,15,11,1957]}","{}"
+Larry_2A_1_xy_mip_clean.png,1359616,"{}",2,1,"{""name"":""polygon"",""all_points_x"":[1043,1180,1268,1557,1943,1964,1941,1243,1041],""all_points_y"":[1877,1372,1201,904,565,1780,1957,1959,1941]}","{}"
+Larry_2A_8_xy_mip_clean.png,1031873,"{}",2,0,"{""name"":""polygon"",""all_points_x"":[975,1206,1509,1932,1973,32,30,32,21,40],""all_points_y"":[1962,1167,763,235,21,13,839,1612,1934,1968]}","{}"
+Larry_2A_8_xy_mip_clean.png,1031873,"{}",2,1,"{""name"":""polygon"",""all_points_x"":[1083,1267,1723,1943,1975,1975,1966,1110],""all_points_y"":[1915,1174,547,290,273,1445,1966,1968]}","{}"
