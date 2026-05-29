@@ -1,19 +1,18 @@
-"""Warp the full-resolution Larry_2A_1 volume into Larry_2A_8's frame
-using the per-blob RANSAC affine and save as a BigTIFF in the same
-format/dtype as the input TIFFs.
+"""Seam-free piecewise warp of A -> B (pipeline stage 4).
 
-Output shape = B's shape (191, 1982, 1981) uint16.
+Same per-blob (affine + TPS-residual) fits as the per-blob RANSAC affines, but
+instead of a HARD per-voxel Voronoi label (which makes the two blobs' transforms
+collide at their boundary -> visible stitch/seam), this
+evaluates BOTH blobs' full warp field everywhere and BLENDS them with smooth
+inverse-distance (Gaussian) weights -> a continuous displacement field, no seam.
 
-For each output voxel (z_b, y_b, x_b):
-  - Look up B's VIA blob mask at (y_b, x_b) -> blob_id in {0, 1, 2}
-  - Apply inverse of that blob's affine (M, t):  p_a = M_inv @ (p_b - t)
-  - Sample A at p_a via trilinear map_coordinates
-  - blob_id == 0 (outside both polygons) -> output 0
-
-Processed slab-by-slab along z to keep memory under control.
+Ported from larry_register_erdem_v4_blobs_3d.py (soft partition-of-unity blend):
+  * both fields evaluated on a coarse grid, trilinearly upsampled  -> low-pass
+  * TPS residual magnitude clipped to MAX_RES_VOX                  -> no smear
+  * weight_k(b) = exp(-d_k(b)/sigma), normalized over blobs        -> no seam
 
 Output:
-  results/larry_within_exvivo_3d/Larry_2A_1_warped_to_2A_8.tif
+  results/Larry_2A_1_warped_to_2A_8.tif
 """
 from __future__ import annotations
 
@@ -23,8 +22,11 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-from scipy.ndimage import distance_transform_edt, map_coordinates
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from scipy.interpolate import RBFInterpolator
+from scipy.ndimage import map_coordinates
 
 from ransac_affine import DATA_DIR, RES, ransac_affine_3d
 from find_landmarks import (
@@ -32,63 +34,62 @@ from find_landmarks import (
     TPS_SMOOTHING, TPS_MAX_CTRL,
 )
 
-A_TIF = DATA_DIR / "Larry_2A_1_488_4x.tif"
-B_TIF = DATA_DIR / "Larry_2A_8_488_4x.tif"
+A_TIF   = DATA_DIR / "Larry_2A_1_488_4x.tif"
+B_TIF   = DATA_DIR / "Larry_2A_8_488_4x.tif"
 OUT_TIF = RES / "Larry_2A_1_warped_to_2A_8.tif"
+OUT_PNG = RES / "warp_mips.png"
 
-SLAB = 16   # output z-slices processed per chunk; balances memory vs speed
+GZ, GY, GX  = 48, 144, 144     # coarse warp grid (eval here, trilinear upsample)
+SLAB        = 8                # output z-slices per chunk
+BLEND_SIGMA = 150.0            # Gaussian blend scale at blob boundary (vox, xy)
+MAX_RES_VOX = 60.0             # clip TPS residual magnitude
+
+
+def closest_xy_dist(grid_pts, anchors):
+    """Min xy-distance from each (z,y,x) grid point to a set of anchors."""
+    out = np.empty(len(grid_pts), dtype=np.float64)
+    chunk = 4096
+    for s in range(0, len(grid_pts), chunk):
+        e = min(s + chunk, len(grid_pts))
+        d = np.linalg.norm(grid_pts[s:e, None, 1:3] - anchors[None, :, 1:3], axis=2)
+        out[s:e] = d.min(axis=1)
+    return out
 
 
 def main() -> None:
-    print(f"[load] reading A volume {A_TIF.name}")
-    t0 = time.time()
-    A_vol = tifffile.imread(str(A_TIF))   # (nz_A, nyA, nxA) uint16
-    print(f"  A_vol: {A_vol.shape} {A_vol.dtype}  ({time.time()-t0:.1f}s)")
+    t_all = time.time()
 
-    print(f"[load] reading B header for shape")
-    with tifffile.TiffFile(str(B_TIF)) as tf:
-        nz_B = len(tf.pages)
-        h_B, w_B = tf.pages[0].shape
-    print(f"  B shape: ({nz_B}, {h_B}, {w_B})")
-
-    # Load saved per-blob affines + rasterize B's VIA blob mask
-    print(f"[fits] loading registration_via_blobs_3d_fits.json")
+    # --- per-blob affines (forward A->B) -> invert to B->A ---
     fits = json.loads((RES / "registration_via_blobs_3d_fits.json").read_text())
     inv_affines = {}
     for r in fits:
         if "note" in r:
             print(f"  blob {r['blob']}: SKIP ({r['note']})")
             continue
-        M = np.array(r["M"])
-        t = np.array(r["t"])
+        M = np.array(r["M"]); t = np.array(r["t"])
         inv_affines[r["blob"]] = (np.linalg.inv(M), t)
-        print(f"  blob {r['blob']}: inl={r['n_inliers']}/{r['n_matches']}  "
-              f"det={r['det']:.3f}")
+        print(f"  blob {r['blob']}: inl={r['n_inliers']}/{r['n_matches']}  det={r['det']:.3f}")
 
-    polys = parse_via_csv(VIA_CSV)
-    B_blob_mask = rasterize_blobs(polys["Larry_2A_8_xy_mip_clean.png"],
-                                  (h_B, w_B))
-    # No cropping: extend blob labels to cover the whole xy frame by
-    # assigning every "outside" pixel to its nearest VIA blob (xy Voronoi
-    # via Euclidean distance transform on the inverted mask).
-    print(f"[extend] filling outside-VIA pixels via nearest-blob Voronoi")
-    _, idx = distance_transform_edt(B_blob_mask == 0, return_indices=True)
-    B_blob_mask = B_blob_mask[idx[0], idx[1]]
-    assert (B_blob_mask > 0).all(), "every xy pixel must now have a blob"
+    # --- B frame shape ---
+    with tifffile.TiffFile(str(B_TIF)) as tf:
+        Bz = len(tf.pages); By, Bx = tf.pages[0].shape
+    print(f"[frame] B = ({Bz}, {By}, {Bx})")
 
-    # Per-blob TPS correction fields (B-indexed, coarse grid)
-    COARSE_Z = 16; COARSE_XY = 16; EVAL_CHUNK = 50_000
-    A_cent_3d = np.load(RES / "A_centroids_3d.npy")
-    B_cent_3d = np.load(RES / "B_centroids_3d.npy")
+    # --- per-blob TPS (built from RANSAC inliers, exactly as warp_volume.py) ---
+    A_cent = np.load(RES / "A_centroids_3d.npy")
+    B_cent = np.load(RES / "B_centroids_3d.npy")
     asn = np.load(RES / "assignments_3d.npz")
-    src_all = A_cent_3d[asn["matches"][:, 0]]
-    dst_all = B_cent_3d[asn["matches"][:, 1]]
+    src_all = A_cent[asn["matches"][:, 0]]
+    dst_all = B_cent[asn["matches"][:, 1]]
+    polys = parse_via_csv(VIA_CSV)
     with tifffile.TiffFile(str(A_TIF)) as tf:
         A_shape = tf.pages[0].shape
-    A_blob_mask_tps = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_shape)
-    match_src_label = assign_centroids_to_blobs(A_cent_3d, A_blob_mask_tps)[asn["matches"][:, 0]]
+    A_blob_mask = rasterize_blobs(polys["Larry_2A_1_xy_mip_clean.png"], A_shape)
+    match_src_label = assign_centroids_to_blobs(A_cent, A_blob_mask)[asn["matches"][:, 0]]
     rng = np.random.default_rng(0)
-    tps_disp_fields = {}   # blob_id -> (dz, dy, dx) coarse arrays on B grid
+
+    tps_per_blob = {}      # blob -> RBFInterpolator(A-space approx -> A target)
+    B_anchors = {}         # blob -> (n,3) B-side z,y,x inlier centroids
     for k, (M_inv_k, t_k) in inv_affines.items():
         idx = match_src_label == k
         if idx.sum() < 4:
@@ -98,98 +99,106 @@ def main() -> None:
             continue
         _, _, inl = result
         sc, dc = src_all[idx][inl], dst_all[idx][inl]
+        B_anchors[k] = dc.astype(np.float64)
         if len(sc) > TPS_MAX_CTRL:
             sub = rng.choice(len(sc), TPS_MAX_CTRL, replace=False)
             sc, dc = sc[sub], dc[sub]
-        # TPS maps affine-inverse(dst) -> src  (correction in A-space)
-        dc_a = (dc - t_k[None, :]) @ M_inv_k.T
-        tps_k = RBFInterpolator(dc_a, sc, kernel="thin_plate_spline", smoothing=TPS_SMOOTHING)
-        zc = np.arange(0, nz_B + COARSE_Z,  COARSE_Z,  dtype=np.float64)
-        yc = np.arange(0, h_B  + COARSE_XY, COARSE_XY, dtype=np.float64)
-        xc = np.arange(0, w_B  + COARSE_XY, COARSE_XY, dtype=np.float64)
-        nzc, nyc, nxc = len(zc), len(yc), len(xc)
-        ZC, YC, XC = np.meshgrid(zc, yc, xc, indexing="ij")
-        gb = np.stack([ZC.ravel(), YC.ravel(), XC.ravel()], axis=1)
-        ga_approx = (gb - t_k[None, :]) @ M_inv_k.T
-        ga_tps = np.empty_like(ga_approx)
-        for i0 in range(0, len(ga_approx), EVAL_CHUNK):
-            i1 = min(len(ga_approx), i0 + EVAL_CHUNK)
-            ga_tps[i0:i1] = tps_k(ga_approx[i0:i1])
-        disp = ga_tps - ga_approx
-        tps_disp_fields[k] = (
-            disp[:, 0].reshape(nzc, nyc, nxc).astype(np.float32),
-            disp[:, 1].reshape(nzc, nyc, nxc).astype(np.float32),
-            disp[:, 2].reshape(nzc, nyc, nxc).astype(np.float32),
-        )
-        print(f"[tps] blob {k}: coarse correction field ({nzc}×{nyc}×{nxc}) ready", flush=True)
+        dc_a = (dc - t_k[None, :]) @ M_inv_k.T          # B-anchors -> A-space (affine)
+        tps_per_blob[k] = RBFInterpolator(
+            dc_a, sc, kernel="thin_plate_spline", smoothing=TPS_SMOOTHING)
+        print(f"[tps] blob {k}: {len(B_anchors[k])} anchors, TPS ready")
 
-    # Output writer (BigTIFF, same dtype as input)
-    print(f"[warp] writing {OUT_TIF}")
-    nz_A, ny_A, nx_A = A_vol.shape
-    out_vol = np.zeros((nz_B, h_B, w_B), dtype=np.uint16)
+    blobs = sorted(inv_affines)
 
-    # Precompute y/x meshgrid for one slab; z varies per slab
-    yy, xx = np.meshgrid(np.arange(h_B, dtype=np.float64),
-                         np.arange(w_B, dtype=np.float64), indexing="ij")
-    by = np.clip(np.round(yy).astype(int), 0, h_B - 1)
-    bx = np.clip(np.round(xx).astype(int), 0, w_B - 1)
-    blob_per_xy = B_blob_mask[by, bx]              # (h_B, w_B) int
+    # --- coarse grid over the whole B frame ---
+    gz = np.linspace(0, Bz - 1, GZ)
+    gy = np.linspace(0, By - 1, GY)
+    gx = np.linspace(0, Bx - 1, GX)
+    GZG, GYG, GXG = np.meshgrid(gz, gy, gx, indexing="ij")
+    flat = np.stack([GZG.ravel(), GYG.ravel(), GXG.ravel()], axis=1)   # (G,3) z,y,x
 
-    masks_for_blob = {k: (blob_per_xy == k) for k in [1, 2]}
+    # --- per-blob full src field (affine-inv + clipped TPS residual) on grid ---
+    src_fields = {}
+    for k in blobs:
+        M_inv_k, t_k = inv_affines[k]
+        aff = (flat - t_k[None, :]) @ M_inv_k.T                        # A-space affine
+        if k in tps_per_blob:
+            CHUNK = 100_000
+            corrected = np.empty_like(aff)
+            for s in range(0, len(aff), CHUNK):
+                e = min(s + CHUNK, len(aff))
+                corrected[s:e] = tps_per_blob[k](aff[s:e])
+            resid = corrected - aff
+            rgn = np.linalg.norm(resid, axis=1)
+            n_clip = int((rgn > MAX_RES_VOX).sum())
+            if n_clip:
+                scale = np.where(rgn > MAX_RES_VOX, MAX_RES_VOX / np.maximum(rgn, 1e-9), 1.0)
+                resid *= scale[:, None]
+            src_fields[k] = aff + resid
+            print(f"[grid] blob {k}: resid p50={np.median(rgn):.2f} "
+                  f"p95={np.percentile(rgn,95):.2f} max={rgn.max():.2f} clip={n_clip}/{len(rgn)}")
+        else:
+            src_fields[k] = aff
 
-    for z0 in range(0, nz_B, SLAB):
-        z1 = min(nz_B, z0 + SLAB)
-        zs = np.arange(z0, z1, dtype=np.float64)
-        t_slab = time.time()
-        for k, (M_inv, t) in inv_affines.items():
-            xy_mask = masks_for_blob[k]
-            if not xy_mask.any():
-                continue
-            # Build coords for all pixels in this slab that fall in blob k
-            n_xy = int(xy_mask.sum())
-            # broadcast: (n_z, n_xy)
-            zb = np.broadcast_to(zs[:, None], (z1 - z0, n_xy)).reshape(-1)
-            yb = np.broadcast_to(yy[xy_mask][None, :], (z1 - z0, n_xy)).reshape(-1)
-            xb = np.broadcast_to(xx[xy_mask][None, :], (z1 - z0, n_xy)).reshape(-1)
-            p_b = np.stack([zb, yb, xb], axis=1)         # (N, 3)
-            # Inverse affine to A coords
-            p_a = (p_b - t[None, :]) @ M_inv.T
-            za = p_a[:, 0]
-            ya = p_a[:, 1]
-            xa = p_a[:, 2]
-            # TPS correction on top of affine
-            if k in tps_disp_fields:
-                dz_f, dy_f, dx_f = tps_disp_fields[k]
-                q = np.stack([zb / COARSE_Z, yb / COARSE_XY, xb / COARSE_XY])
-                za = za + map_coordinates(dz_f, q, order=1, mode="nearest")
-                ya = ya + map_coordinates(dy_f, q, order=1, mode="nearest")
-                xa = xa + map_coordinates(dx_f, q, order=1, mode="nearest")
-            # Sample
-            sampled = map_coordinates(
-                A_vol, np.stack([za, ya, xa]),
-                order=1, mode="constant", cval=0.0,
-            ).astype(np.uint16)
-            # Write into output slab via flat indexing
-            slab_view = out_vol[z0:z1]
-            # broadcast back: for each z in slab, for each in-mask (y, x)
-            zi_arr = np.repeat(np.arange(z1 - z0), n_xy)
-            yx_y = np.tile(yy[xy_mask].astype(int), z1 - z0)
-            yx_x = np.tile(xx[xy_mask].astype(int), z1 - z0)
-            slab_view[zi_arr, yx_y, yx_x] = sampled
-        print(f"  z={z0}-{z1-1}/{nz_B-1}  slab {time.time()-t_slab:.1f}s",
-              flush=True)
+    # --- smooth inverse-distance blend weights (partition of unity) ---
+    print(f"[blend] sigma={BLEND_SIGMA} vox")
+    weights = {}
+    wsum = np.zeros(len(flat))
+    for k in blobs:
+        d = closest_xy_dist(flat, B_anchors[k])
+        w = np.exp(-d / BLEND_SIGMA)
+        weights[k] = w
+        wsum += w
+    wsum += 1e-12
+    src = sum(src_fields[k] * (weights[k] / wsum)[:, None] for k in blobs)
+    src_grid = src.reshape(GZ, GY, GX, 3)
 
-    print(f"[save] writing BigTIFF")
-    tifffile.imwrite(
-        str(OUT_TIF), out_vol,
-        bigtiff=True,
-        photometric="minisblack",
-        compression="zlib",
-        compressionargs={"level": 4},
-        metadata={"axes": "ZYX"},
-    )
-    print(f"[done] wrote {OUT_TIF}  "
-          f"({OUT_TIF.stat().st_size / 1e9:.2f} GB)")
+    # --- warp slab-by-slab: trilinear-upsample src grid, sample A ---
+    print(f"[load] {A_TIF.name}")
+    A_f = tifffile.imread(str(A_TIF)).astype(np.float32)
+    out_xy_mip = np.zeros((By, Bx), dtype=np.float32)
+    print(f"[warp] writing {OUT_TIF.name}")
+    with tifffile.TiffWriter(str(OUT_TIF), bigtiff=True) as tw:
+        for z0 in range(0, Bz, SLAB):
+            z1 = min(z0 + SLAB, Bz); t0 = time.time()
+            zz, yy, xx = np.meshgrid(
+                np.arange(z0, z1, dtype=np.float32),
+                np.arange(By, dtype=np.float32),
+                np.arange(Bx, dtype=np.float32),
+                indexing="ij")
+            nz = (zz / (Bz - 1)) * (GZ - 1)
+            ny = (yy / (By - 1)) * (GY - 1)
+            nx = (xx / (Bx - 1)) * (GX - 1)
+            sz = map_coordinates(src_grid[..., 0], [nz, ny, nx], order=1, mode="nearest")
+            sy = map_coordinates(src_grid[..., 1], [nz, ny, nx], order=1, mode="nearest")
+            sx = map_coordinates(src_grid[..., 2], [nz, ny, nx], order=1, mode="nearest")
+            samp = map_coordinates(A_f, [sz, sy, sx], order=1, mode="constant", cval=0.0)
+            samp = np.clip(samp, 0, 65535).astype(np.uint16)
+            tw.write(samp, photometric="minisblack", compression="zlib",
+                     compressionargs={"level": 4})
+            np.maximum(out_xy_mip, samp.astype(np.float32).max(0), out=out_xy_mip)
+            print(f"  z={z0:3d}-{z1-1:3d}/{Bz-1}  slab {time.time()-t0:.1f}s", flush=True)
+
+    np.save(RES / "Larry_2A_1_warped_to_2A_8_xy_mip.npy", out_xy_mip)
+    print(f"[done] {OUT_TIF}  ({OUT_TIF.stat().st_size/1e9:.2f} GB)  "
+          f"wall {time.time()-t_all:.1f}s")
+
+    # --- visualization: XY MIPs (A source, B target, blended warp, overlay) ---
+    print(f"[viz] {OUT_PNG.name}")
+    A_mip = A_f.max(0)
+    B_mip = tifffile.imread(str(B_TIF)).max(0).astype(np.float32)
+    norm = lambda im: np.clip(im / (np.percentile(im, 99.5) + 1e-6), 0, 1)
+    Wn, Bn = norm(out_xy_mip), norm(B_mip)
+    fig, ax = plt.subplots(1, 4, figsize=(22, 6))
+    for a, im, ttl in zip(ax[:3], [norm(A_mip), Bn, Wn],
+                          ["A (source)", "B (target)", "A blend-warped -> B"]):
+        a.imshow(im, cmap="gray"); a.set_title(ttl); a.axis("off")
+    ov = np.zeros((*Bn.shape, 3)); ov[..., 1] = Bn; ov[..., 0] = Wn
+    ax[3].imshow(ov); ax[3].set_title("overlay (B=green, warped=red)"); ax[3].axis("off")
+    fig.suptitle("seam-free piecewise warp (per-blob affine+TPS, Gaussian "
+                 f"distance blend sigma={BLEND_SIGMA:.0f} vox)")
+    fig.tight_layout(); fig.savefig(OUT_PNG, dpi=130)
+    print(f"[save] {OUT_PNG}")
 
 
 if __name__ == "__main__":

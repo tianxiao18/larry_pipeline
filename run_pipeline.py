@@ -6,7 +6,7 @@ single stage with `python run_pipeline.py <stage_name>`.
     Stage 1  exvivo_segmentation    Cellpose 3D -> per-volume centroids + masks
     Stage 2  soma_print_match       k-NN soma-print + Hungarian -> 1:1 matches
     Stage 3  find_landmarks         Per-blob RANSAC affine on matches -> inliers
-    Stage 4  warp_volume            Apply per-blob affine to the full A TIF -> BigTIFF
+    Stage 4  warp_volume            Seam-free per-blob affine+TPS (Gaussian blend) -> BigTIFF
 """
 from __future__ import annotations
 
@@ -26,8 +26,9 @@ STAGES: list[tuple[str, str]] = [
      "Assign each centroid to a VIA-drawn blob, fit a RANSAC affine per blob, "
      "and dump inlier (A,B) landmark pairs to JSON."),
     ("warp_volume",
-     "For each output voxel in B's frame, look up its blob, invert that blob's "
-     "affine, and trilinearly sample A -> writes a BigTIFF in B's shape."),
+     "Evaluate both blobs' affine+TPS warp fields over B's frame, blend them "
+     "with Gaussian distance weights (seam-free), then trilinearly sample A -> "
+     "writes a BigTIFF in B's shape. (warp_volume_hard.py = old hard-Voronoi version.)"),
 ]
 
 
